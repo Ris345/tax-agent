@@ -89,9 +89,6 @@ public sealed class CognitoStack : Stack
                 Email = new StandardAttribute { Required = true, Mutable = true },
             },
 
-            // Temporary passwords expire after 7 days.
-            TemporaryPasswordValidity = Duration.Days(7),
-
             // Strong password policy.
             PasswordPolicy = new PasswordPolicy
             {
@@ -113,9 +110,6 @@ public sealed class CognitoStack : Stack
             // Advanced security mode: Cognito risk-based adaptive authentication.
             // Flags impossible-travel, credential stuffing, etc.
             AdvancedSecurityMode = AdvancedSecurityMode.ENFORCED,
-
-            // Don't reveal whether an account exists (prevents enumeration).
-            PreventUserExistenceErrors = true,
 
             // Send email via Cognito's built-in SES integration (no custom SES needed).
             UserVerification = new UserVerificationConfig
@@ -227,13 +221,8 @@ public sealed class CognitoStack : Stack
 
         _ = new CfnOutput(this, "ClientSecretNote", new CfnOutputProps
         {
-            Description =
-                "Retrieve the client secret: " +
-                $"aws cognito-idp describe-user-pool-client " +
-                $"--user-pool-id {userPool.UserPoolId} " +
-                $"--client-id {appClient.UserPoolClientId} " +
-                "--query UserPoolClient.ClientSecret --output text",
-            Value = "See description — not printed here for security",
+            Description = "Retrieve the client secret using the UserPoolId and ClientId outputs above",
+            Value = $"aws cognito-idp describe-user-pool-client --user-pool-id {userPool.UserPoolId} --client-id {appClient.UserPoolClientId} --query UserPoolClient.ClientSecret --output text",
         });
 
         _ = new CfnOutput(this, "Region", new CfnOutputProps

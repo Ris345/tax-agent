@@ -5,7 +5,6 @@ using Amazon.CDK.AWS.Lambda;
 using Amazon.CDK.AWS.Logs;
 using Amazon.CDK.AWS.S3;
 using Amazon.CDK.AWS.S3.Notifications;
-using Amazon.CDK.AWS.SecretsManager;
 using Amazon.CDK.AWS.DynamoDB;
 using Amazon.CDK.AWS.SQS;
 using Constructs;
@@ -40,10 +39,8 @@ public sealed class W2TextractStack : Stack
         : base(scope, id, props)
     {
         // ── Context values ────────────────────────────────────────────────────
-        var confidenceThreshold       = Node.TryGetContext("confidenceThreshold")       as string ?? "85.0";
-        var claudeConfidenceThreshold = Node.TryGetContext("claudeConfidenceThreshold") as string ?? "80.0";
-        var claudeModel               = Node.TryGetContext("claudeModel")               as string ?? "claude-sonnet-4-20250514";
-        var existingBucketName        = Node.TryGetContext("existingBucketName")        as string;
+        var confidenceThreshold = Node.TryGetContext("confidenceThreshold") as string ?? "85.0";
+        var existingBucketName  = Node.TryGetContext("existingBucketName") as string;
 
         // ── KMS key ───────────────────────────────────────────────────────────
         var kmsKey = new Key(this, "W2KmsKey", new KeyProps
@@ -54,29 +51,12 @@ public sealed class W2TextractStack : Stack
             Alias             = "alias/tax-agent-w2",
         });
 
-        // ── Secrets Manager: Anthropic API key ────────────────────────────────
-        // The secret value is intentionally left empty here — populate it out-of-band
-        // with `aws secretsmanager put-secret-value` after the first `cdk deploy`.
-        // The Python code reads it at Lambda cold-start via boto3.
-        var anthropicSecret = new Amazon.CDK.AWS.SecretsManager.Secret(
-            this, "AnthropicApiKeySecret",
-            new SecretProps
-            {
-                SecretName  = "tax-agent/anthropic-api-key",
-                Description = "Anthropic API key for W-2 Claude Sonnet 4 vision fallback",
-                // Encrypt the secret with the same KMS key used for S3 so a single
-                // key policy controls access to both the documents and the API key.
-                EncryptionKey = kmsKey,
-            });
-
         // ── Dead-letter queue ─────────────────────────────────────────────────
         var dlq = new Queue(this, "W2ProcessingDlq", new QueueProps
         {
-            QueueName                 = "w2-textract-dlq.fifo",
-            Fifo                      = true,
-            ContentBasedDeduplication = true,
-            RetentionPeriod           = Duration.Days(14),
-            Encryption                = QueueEncryption.KMS_MANAGED,
+            QueueName       = "w2-textract-dlq",
+            RetentionPeriod = Duration.Days(14),
+            Encryption      = QueueEncryption.KMS_MANAGED,
         });
 
         // ── DynamoDB: tax document storage ───────────────────────────────────
@@ -86,8 +66,8 @@ public sealed class W2TextractStack : Stack
         var taxDocsTable = new Table(this, "TaxDocumentsTable", new TableProps
         {
             TableName         = $"tax-documents-{Account}-{Region}",
-            PartitionKey      = new Attribute { Name = "user_id", Type = AttributeType.STRING },
-            SortKey           = new Attribute { Name = "doc_id",  Type = AttributeType.STRING },
+            PartitionKey      = new Amazon.CDK.AWS.DynamoDB.Attribute { Name = "user_id", Type = AttributeType.STRING },
+            SortKey           = new Amazon.CDK.AWS.DynamoDB.Attribute { Name = "doc_id",  Type = AttributeType.STRING },
             BillingMode       = BillingMode.PAY_PER_REQUEST,
             PointInTimeRecovery = true,
             Encryption        = TableEncryption.CUSTOMER_MANAGED,
@@ -126,16 +106,6 @@ public sealed class W2TextractStack : Stack
             Resources = new[] { kmsKey.KeyArn },
         }));
 
-        // Secrets Manager: read the Anthropic API key at cold-start
-        // GetSecretValue is the only operation the Lambda needs.
-        lambdaRole.AddToPolicy(new PolicyStatement(new PolicyStatementProps
-        {
-            Sid       = "ReadAnthropicApiKey",
-            Effect    = Effect.ALLOW,
-            Actions   = new[] { "secretsmanager:GetSecretValue" },
-            Resources = new[] { anthropicSecret.SecretArn },
-        }));
-
         // SQS: write failed invocations to DLQ
         dlq.GrantSendMessages(lambdaRole);
 
@@ -154,29 +124,16 @@ public sealed class W2TextractStack : Stack
             Handler       = "handler.handler",
             Code          = Code.FromAsset("../lambda/textract_w2"),
             Role          = lambdaRole,
-            // Breakdown of the 120 s budget:
-            //   Textract AnalyzeDocument : ~10–30 s
-            //   S3 GetObject (raw page)  : ~1–3 s
-            //   Claude Sonnet 4 stream   : ~10–40 s (model + PDF size dependent)
-            Timeout       = Duration.Seconds(120),
-            MemorySize    = 512,
-            RetryAttempts = 1,
+            Timeout         = Duration.Seconds(60),
+            MemorySize      = 512,
+            RetryAttempts   = 1,
             DeadLetterQueue = dlq,
-            Environment   = new Dictionary<string, string>
+            Environment     = new Dictionary<string, string>
             {
-                // Textract confidence gate
-                ["CONFIDENCE_THRESHOLD"]        = confidenceThreshold,
-                // Claude confidence gate (applied after fallback)
-                ["CLAUDE_CONFIDENCE_THRESHOLD"] = claudeConfidenceThreshold,
-                // Model string passed through to claude_fallback.py
-                ["CLAUDE_MODEL"]                = claudeModel,
-                // Secret ARN read at cold-start; no plain-text key in env
-                ["ANTHROPIC_SECRET_ARN"]        = anthropicSecret.SecretArn,
-                // DynamoDB storage for extracted schemas + encrypted PII
-                ["TAX_DOCS_TABLE_NAME"]         = taxDocsTable.TableName,
-                // AWS Encryption SDK uses this CMK for field-level PII encryption
-                ["TAX_STORAGE_KMS_KEY_ARN"]     = kmsKey.KeyArn,
-                ["LOG_LEVEL"]                   = "INFO",
+                ["CONFIDENCE_THRESHOLD"]    = confidenceThreshold,
+                ["TAX_DOCS_TABLE_NAME"]     = taxDocsTable.TableName,
+                ["TAX_STORAGE_KMS_KEY_ARN"] = kmsKey.KeyArn,
+                ["LOG_LEVEL"]               = "INFO",
             },
         });
 
@@ -283,13 +240,6 @@ public sealed class W2TextractStack : Stack
             Description = "Dead-letter queue ARN for failed invocations",
             Value       = dlq.QueueArn,
             ExportName  = "W2TextractDlqArn",
-        });
-
-        _ = new CfnOutput(this, "AnthropicSecretArn", new CfnOutputProps
-        {
-            Description = "Secrets Manager ARN — populate with your Anthropic API key",
-            Value       = anthropicSecret.SecretArn,
-            ExportName  = "W2TextractAnthropicSecretArn",
         });
 
         _ = new CfnOutput(this, "TaxDocumentsTableName", new CfnOutputProps

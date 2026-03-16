@@ -55,13 +55,10 @@ public sealed class TaxPipelineStack : Stack
                 EncryptionKey     = kmsKey,
             });
 
-        var anthropicSecretArn = Fn.ImportValue("W2TextractAnthropicSecretArn");
-        var storageKmsKeyArn   = kmsKeyArn;
+        var storageKmsKeyArn = kmsKeyArn;
 
         // ── Context overrides ─────────────────────────────────────────────────
-        var claudeModel               = Node.TryGetContext("claudeModel")               as string ?? "claude-sonnet-4-20250514";
-        var confidenceThreshold       = Node.TryGetContext("confidenceThreshold")       as string ?? "85.0";
-        var claudeConfidenceThreshold = Node.TryGetContext("claudeConfidenceThreshold") as string ?? "80.0";
+        var confidenceThreshold = Node.TryGetContext("confidenceThreshold") as string ?? "85.0";
 
         // ── Optional SNS alert topic ──────────────────────────────────────────
         var alertTopic = new Topic(this, "PipelineAlertTopic", new TopicProps
@@ -76,8 +73,6 @@ public sealed class TaxPipelineStack : Stack
         {
             ["LOG_LEVEL"]               = "INFO",
             ["CONFIDENCE_THRESHOLD"]    = confidenceThreshold,
-            ["ANTHROPIC_SECRET_ARN"]    = anthropicSecretArn,
-            ["CLAUDE_MODEL"]            = claudeModel,
             ["TAX_DOCS_TABLE_NAME"]     = tableName,
             ["TAX_STORAGE_KMS_KEY_ARN"] = storageKmsKeyArn,
         };
@@ -107,7 +102,7 @@ public sealed class TaxPipelineStack : Stack
                 Environment  = env,
             });
 
-            _ = new LogGroup(this, id + "Logs", new LogGroupProps
+            _ = new LogGroup(this, id + "Logs", new Amazon.CDK.AWS.Logs.LogGroupProps
             {
                 LogGroupName  = $"/aws/lambda/{name}",
                 Retention     = RetentionDays.ONE_MONTH,
@@ -131,23 +126,6 @@ public sealed class TaxPipelineStack : Stack
         }));
         bucket.GrantRead(textractFn);
         kmsKey.GrantDecrypt(textractFn);
-
-        var claudeFn = MakeLambda(
-            "ClaudeFallbackFn", "tax-pipeline-claude-fallback", "handler.handler",
-            "../lambda/claude_fallback_fn", timeoutSecs: 90, memorySizeMb: 512,
-            extraEnv: new Dictionary<string, string>
-            {
-                ["CLAUDE_CONFIDENCE_THRESHOLD"] = claudeConfidenceThreshold,
-            });
-
-        bucket.GrantRead(claudeFn);
-        kmsKey.GrantDecrypt(claudeFn);
-        claudeFn.AddToRolePolicy(new PolicyStatement(new PolicyStatementProps
-        {
-            Sid       = "ReadAnthropicSecret",
-            Actions   = new[] { "secretsmanager:GetSecretValue" },
-            Resources = new[] { anthropicSecretArn },
-        }));
 
         var validatorFn = MakeLambda(
             "ValidatorFn", "tax-pipeline-validator", "handler.handler",
@@ -190,7 +168,7 @@ public sealed class TaxPipelineStack : Stack
         });
 
         // Allow the state machine to invoke each Lambda
-        foreach (var fn in new[] { textractFn, claudeFn, validatorFn, storeFn, pdfFn, errorFn })
+        foreach (var fn in new[] { textractFn, validatorFn, storeFn, pdfFn, errorFn })
         {
             fn.GrantInvoke(sfnRole);
         }
@@ -201,13 +179,17 @@ public sealed class TaxPipelineStack : Stack
             Actions = new[]
             {
                 "logs:CreateLogDelivery",
+                "logs:CreateLogGroup",
+                "logs:CreateLogStream",
+                "logs:DescribeLogGroups",
+                "logs:DescribeLogStreams",
+                "logs:DescribeResourcePolicies",
                 "logs:GetLogDelivery",
+                "logs:ListLogDeliveries",
+                "logs:PutLogEvents",
+                "logs:PutResourcePolicy",
                 "logs:UpdateLogDelivery",
                 "logs:DeleteLogDelivery",
-                "logs:ListLogDeliveries",
-                "logs:PutResourcePolicy",
-                "logs:DescribeResourcePolicies",
-                "logs:DescribeLogGroups",
             },
             Resources = new[] { "*" },
         }));
@@ -216,12 +198,22 @@ public sealed class TaxPipelineStack : Stack
         var aslPath  = Path.GetFullPath("../infrastructure/statemachine/tax_pipeline.asl.json");
         var aslBody  = File.ReadAllText(aslPath);
 
-        var sfnLogGroup = new LogGroup(this, "StateMachineLogGroup", new LogGroupProps
+        var sfnLogGroup = new LogGroup(this, "StateMachineLogGroup", new Amazon.CDK.AWS.Logs.LogGroupProps
         {
             LogGroupName  = "/aws/states/tax-pipeline",
             Retention     = RetentionDays.ONE_MONTH,
             RemovalPolicy = RemovalPolicy.DESTROY,
         });
+
+        // Step Functions uses the log delivery service — requires a resource policy
+        // on the log group in addition to the IAM role permissions.
+        sfnLogGroup.AddToResourcePolicy(new PolicyStatement(new PolicyStatementProps
+        {
+            Effect     = Effect.ALLOW,
+            Principals = new IPrincipal[] { new ServicePrincipal("delivery.logs.amazonaws.com") },
+            Actions    = new[] { "logs:CreateLogStream", "logs:PutLogEvents" },
+            Resources  = new[] { sfnLogGroup.LogGroupArn + ":*" },
+        }));
 
         var stateMachine = new CfnStateMachine(this, "TaxPipelineStateMachine",
             new CfnStateMachineProps
@@ -230,11 +222,10 @@ public sealed class TaxPipelineStack : Stack
                 StateMachineType = "STANDARD",
                 RoleArn          = sfnRole.RoleArn,
                 // CDK DefinitionSubstitutions replaces ${...} tokens in the ASL at deploy time
-                Definition       = aslBody,
+                DefinitionString = aslBody,
                 DefinitionSubstitutions = new Dictionary<string, string>
                 {
                     ["TextractFunctionArn"]     = textractFn.FunctionArn,
-                    ["ClaudeFallbackFunctionArn"] = claudeFn.FunctionArn,
                     ["ValidatorFunctionArn"]    = validatorFn.FunctionArn,
                     ["StoreFunctionArn"]        = storeFn.FunctionArn,
                     ["PDFGeneratorFunctionArn"] = pdfFn.FunctionArn,
@@ -307,7 +298,7 @@ public sealed class TaxPipelineStack : Stack
                     },
                 },
             },
-            Targets = new IRule[] { sfnTarget },
+            Targets = new IRuleTarget[] { sfnTarget },
         });
 
         // ── Outputs ───────────────────────────────────────────────────────────

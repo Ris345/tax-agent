@@ -1,11 +1,11 @@
 {
-  "Comment": "Tax document processing pipeline — S3 trigger → Textract → Confidence Check → Claude Fallback → Pydantic Validation → DynamoDB → PDF. Lambda ARNs are substituted by CDK DefinitionSubstitutions at deploy time.",
+  "Comment": "Tax document processing pipeline — S3 trigger → Textract → Pydantic Validation → DynamoDB → PDF. Lambda ARNs are substituted by CDK DefinitionSubstitutions at deploy time.",
   "StartAt": "ExtractWithTextract",
   "States": {
 
     "ExtractWithTextract": {
       "Type": "Task",
-      "Comment": "Run Textract QUERIES adapter for all W-2/1099 fields. Returns confidence-scored payload plus a 'needs_claude_fallback' boolean in summary.",
+      "Comment": "Run Textract QUERIES adapter for all W-2/1099 fields. Returns confidence-scored payload.",
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
         "FunctionName": "${TextractFunctionArn}",
@@ -55,74 +55,6 @@
           "ErrorEquals": ["States.ALL"],
           "ResultPath": "$.error",
           "Next": "TextractFailed"
-        }
-      ],
-      "Next": "CheckConfidence"
-    },
-
-    "CheckConfidence": {
-      "Type": "Choice",
-      "Comment": "Branch based on whether any fields fell below the confidence threshold. The Textract Lambda sets summary.needs_claude_fallback = true when flagged_fields is non-empty.",
-      "Choices": [
-        {
-          "Variable": "$.textract.summary.needs_claude_fallback",
-          "BooleanEquals": true,
-          "Next": "ClaudeFallback"
-        }
-      ],
-      "Default": "ValidateDocument"
-    },
-
-    "ClaudeFallback": {
-      "Type": "Task",
-      "Comment": "Re-extract only the flagged low-confidence fields using Claude vision. Failure is non-fatal: the Catch routes to ValidateDocument with the original Textract payload.",
-      "Resource": "arn:aws:states:::lambda:invoke",
-      "Parameters": {
-        "FunctionName": "${ClaudeFallbackFunctionArn}",
-        "Payload": {
-          "bucket.$":          "$.bucket",
-          "key.$":             "$.key",
-          "textract_payload.$": "$.textract"
-        }
-      },
-      "ResultSelector": {
-        "document_type.$": "$.Payload.document_type",
-        "tax_year.$":      "$.Payload.tax_year",
-        "fields.$":        "$.Payload.fields",
-        "summary.$":       "$.Payload.summary"
-      },
-      "ResultPath": "$.textract",
-      "Retry": [
-        {
-          "Comment": "Lambda platform errors",
-          "ErrorEquals": [
-            "Lambda.ServiceException",
-            "Lambda.AWSLambdaException",
-            "Lambda.SdkClientException"
-          ],
-          "IntervalSeconds": 5,
-          "MaxAttempts": 2,
-          "BackoffRate": 2,
-          "JitterStrategy": "FULL"
-        },
-        {
-          "Comment": "Claude API rate limits — longer pause, more attempts",
-          "ErrorEquals": [
-            "ClaudeRateLimitError",
-            "Lambda.TooManyRequestsException"
-          ],
-          "IntervalSeconds": 30,
-          "MaxAttempts": 3,
-          "BackoffRate": 2,
-          "JitterStrategy": "FULL"
-        }
-      ],
-      "Catch": [
-        {
-          "Comment": "Claude failure is non-fatal — Textract payload already in $.textract; proceed to validate with what we have.",
-          "ErrorEquals": ["States.ALL"],
-          "ResultPath": "$.claude_error",
-          "Next": "ValidateDocument"
         }
       ],
       "Next": "ValidateDocument"
