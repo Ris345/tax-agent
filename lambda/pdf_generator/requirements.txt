@@ -1,0 +1,2 @@
+# fpdf2 — pure-Python PDF generation (MIT licence, no system dependencies)
+fpdf2>=2.7.9

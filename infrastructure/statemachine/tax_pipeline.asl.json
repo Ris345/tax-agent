@@ -1,0 +1,387 @@
+{
+  "Comment": "Tax document processing pipeline — S3 trigger → Textract → Confidence Check → Claude Fallback → Pydantic Validation → DynamoDB → PDF. Lambda ARNs are substituted by CDK DefinitionSubstitutions at deploy time.",
+  "StartAt": "ExtractWithTextract",
+  "States": {
+
+    "ExtractWithTextract": {
+      "Type": "Task",
+      "Comment": "Run Textract QUERIES adapter for all W-2/1099 fields. Returns confidence-scored payload plus a 'needs_claude_fallback' boolean in summary.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${TextractFunctionArn}",
+        "Payload": {
+          "bucket.$":        "$.bucket",
+          "key.$":           "$.key",
+          "user_id.$":       "$.user_id",
+          "document_type.$": "$.document_type"
+        }
+      },
+      "ResultSelector": {
+        "document_type.$": "$.Payload.document_type",
+        "tax_year.$":      "$.Payload.tax_year",
+        "fields.$":        "$.Payload.fields",
+        "summary.$":       "$.Payload.summary"
+      },
+      "ResultPath": "$.textract",
+      "Retry": [
+        {
+          "Comment": "Transient Lambda platform errors — short backoff, 3 attempts",
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 3,
+          "MaxAttempts": 3,
+          "BackoffRate": 2,
+          "JitterStrategy": "FULL"
+        },
+        {
+          "Comment": "Textract service throttling — longer backoff, 5 attempts",
+          "ErrorEquals": [
+            "Textract.TextractException",
+            "Textract.ProvisionedThroughputExceededException",
+            "Textract.ThrottlingException"
+          ],
+          "IntervalSeconds": 10,
+          "MaxAttempts": 5,
+          "BackoffRate": 2,
+          "JitterStrategy": "FULL"
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "TextractFailed"
+        }
+      ],
+      "Next": "CheckConfidence"
+    },
+
+    "CheckConfidence": {
+      "Type": "Choice",
+      "Comment": "Branch based on whether any fields fell below the confidence threshold. The Textract Lambda sets summary.needs_claude_fallback = true when flagged_fields is non-empty.",
+      "Choices": [
+        {
+          "Variable": "$.textract.summary.needs_claude_fallback",
+          "BooleanEquals": true,
+          "Next": "ClaudeFallback"
+        }
+      ],
+      "Default": "ValidateDocument"
+    },
+
+    "ClaudeFallback": {
+      "Type": "Task",
+      "Comment": "Re-extract only the flagged low-confidence fields using Claude vision. Failure is non-fatal: the Catch routes to ValidateDocument with the original Textract payload.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${ClaudeFallbackFunctionArn}",
+        "Payload": {
+          "bucket.$":          "$.bucket",
+          "key.$":             "$.key",
+          "textract_payload.$": "$.textract"
+        }
+      },
+      "ResultSelector": {
+        "document_type.$": "$.Payload.document_type",
+        "tax_year.$":      "$.Payload.tax_year",
+        "fields.$":        "$.Payload.fields",
+        "summary.$":       "$.Payload.summary"
+      },
+      "ResultPath": "$.textract",
+      "Retry": [
+        {
+          "Comment": "Lambda platform errors",
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 2,
+          "BackoffRate": 2,
+          "JitterStrategy": "FULL"
+        },
+        {
+          "Comment": "Claude API rate limits — longer pause, more attempts",
+          "ErrorEquals": [
+            "ClaudeRateLimitError",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 30,
+          "MaxAttempts": 3,
+          "BackoffRate": 2,
+          "JitterStrategy": "FULL"
+        }
+      ],
+      "Catch": [
+        {
+          "Comment": "Claude failure is non-fatal — Textract payload already in $.textract; proceed to validate with what we have.",
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.claude_error",
+          "Next": "ValidateDocument"
+        }
+      ],
+      "Next": "ValidateDocument"
+    },
+
+    "ValidateDocument": {
+      "Type": "Task",
+      "Comment": "Run Pydantic v2 validation via from_textract_payload(). Raises PydanticValidationError on schema violations, which routes to ValidationFailed.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${ValidatorFunctionArn}",
+        "Payload": {
+          "textract_payload.$": "$.textract",
+          "document_type.$":    "$.document_type"
+        }
+      },
+      "ResultSelector": {
+        "document.$":  "$.Payload.document",
+        "is_valid.$":  "$.Payload.is_valid",
+        "warnings.$":  "$.Payload.warnings"
+      },
+      "ResultPath": "$.validation",
+      "Retry": [
+        {
+          "Comment": "Platform/cold-start errors only — validation failures should not be retried",
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 2,
+          "BackoffRate": 2,
+          "JitterStrategy": "FULL"
+        }
+      ],
+      "Catch": [
+        {
+          "Comment": "Pydantic schema violations or missing required fields",
+          "ErrorEquals": ["PydanticValidationError", "ValueError", "KeyError"],
+          "ResultPath": "$.error",
+          "Next": "ValidationFailed"
+        },
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "ValidationFailed"
+        }
+      ],
+      "Next": "StoreInDynamoDB"
+    },
+
+    "StoreInDynamoDB": {
+      "Type": "Task",
+      "Comment": "Persist the validated tax document with field-level PII encryption. Idempotency is enforced by ConditionExpression on the generated doc_id.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${StoreFunctionArn}",
+        "Payload": {
+          "user_id.$":        "$.user_id",
+          "document.$":       "$.validation.document",
+          "source.$":         "$.textract.summary.source",
+          "bucket.$":         "$.bucket",
+          "key.$":            "$.key",
+          "field_metadata.$": "$.textract.fields"
+        }
+      },
+      "ResultSelector": {
+        "doc_id.$":  "$.Payload.doc_id",
+        "stored.$":  "$.Payload.stored"
+      },
+      "ResultPath": "$.storage",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 3,
+          "MaxAttempts": 3,
+          "BackoffRate": 2,
+          "JitterStrategy": "FULL"
+        },
+        {
+          "Comment": "DynamoDB throughput exceptions — longer backoff",
+          "ErrorEquals": [
+            "DynamoDB.ProvisionedThroughputExceededException",
+            "DynamoDB.RequestLimitExceeded"
+          ],
+          "IntervalSeconds": 10,
+          "MaxAttempts": 5,
+          "BackoffRate": 2,
+          "JitterStrategy": "FULL"
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "StorageFailed"
+        }
+      ],
+      "Next": "GeneratePDF"
+    },
+
+    "GeneratePDF": {
+      "Type": "Task",
+      "Comment": "Generate a formatted PDF summary of the extracted tax document, upload to S3, and return a time-limited presigned URL. Failure is non-fatal since the record is already stored.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${PDFGeneratorFunctionArn}",
+        "Payload": {
+          "document.$": "$.validation.document",
+          "doc_id.$":   "$.storage.doc_id",
+          "user_id.$":  "$.user_id",
+          "bucket.$":   "$.bucket"
+        }
+      },
+      "ResultSelector": {
+        "pdf_key.$":       "$.Payload.pdf_key",
+        "presigned_url.$": "$.Payload.presigned_url",
+        "expires_in.$":    "$.Payload.expires_in"
+      },
+      "ResultPath": "$.pdf",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 2,
+          "BackoffRate": 2,
+          "JitterStrategy": "FULL"
+        }
+      ],
+      "Catch": [
+        {
+          "Comment": "PDF generation is non-fatal — document already stored; record the warning and succeed.",
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.pdf_error",
+          "Next": "PipelineSucceeded"
+        }
+      ],
+      "Next": "PipelineSucceeded"
+    },
+
+    "PipelineSucceeded": {
+      "Type": "Succeed",
+      "Comment": "All mandatory stages completed. $.pdf may be absent if PDF generation failed non-fatally."
+    },
+
+    "TextractFailed": {
+      "Type": "Task",
+      "Comment": "Record Textract failure for alerting / DLQ replay then terminate.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${ErrorHandlerFunctionArn}",
+        "Payload": {
+          "pipeline_stage": "TextractExtraction",
+          "bucket.$":       "$.bucket",
+          "key.$":          "$.key",
+          "user_id.$":      "$.user_id",
+          "error.$":        "$.error"
+        }
+      },
+      "ResultPath": null,
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 2,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": null,
+          "Next": "PipelineFailed"
+        }
+      ],
+      "Next": "PipelineFailed"
+    },
+
+    "ValidationFailed": {
+      "Type": "Task",
+      "Comment": "Record validation failure. This indicates a schema or data quality problem — human review may be required.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${ErrorHandlerFunctionArn}",
+        "Payload": {
+          "pipeline_stage": "PydanticValidation",
+          "bucket.$":       "$.bucket",
+          "key.$":          "$.key",
+          "user_id.$":      "$.user_id",
+          "error.$":        "$.error"
+        }
+      },
+      "ResultPath": null,
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 2,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": null,
+          "Next": "PipelineFailed"
+        }
+      ],
+      "Next": "PipelineFailed"
+    },
+
+    "StorageFailed": {
+      "Type": "Task",
+      "Comment": "Record DynamoDB storage failure. Document was validated but not persisted.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${ErrorHandlerFunctionArn}",
+        "Payload": {
+          "pipeline_stage": "DynamoDBStorage",
+          "bucket.$":       "$.bucket",
+          "key.$":          "$.key",
+          "user_id.$":      "$.user_id",
+          "error.$":        "$.error"
+        }
+      },
+      "ResultPath": null,
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 2,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": null,
+          "Next": "PipelineFailed"
+        }
+      ],
+      "Next": "PipelineFailed"
+    },
+
+    "PipelineFailed": {
+      "Type": "Fail",
+      "Comment": "Terminal pipeline failure. Check ErrorHandler Lambda logs and CloudWatch Metrics for the pipeline_stage label."
+    }
+
+  }
+}

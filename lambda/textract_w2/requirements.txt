@@ -1,0 +1,4 @@
+# Runtime dependencies bundled into the Lambda deployment package.
+# boto3 is provided by the Lambda Python 3.12 runtime — do NOT include it.
+anthropic>=0.51.0
+pydantic>=2.0.0

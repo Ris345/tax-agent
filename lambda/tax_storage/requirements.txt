@@ -1,0 +1,8 @@
+# Runtime dependencies for tax_storage Lambda layer / package.
+# boto3 / botocore are provided by the Python 3.12 Lambda runtime — omit them.
+
+# AWS Encryption SDK v3 — field-level PII encryption with KMS + local data-key cache
+aws-encryption-sdk>=3.1.1
+
+# Pydantic v2 — used by tax_models (imported by the handler that calls tax_storage)
+pydantic>=2.0.0

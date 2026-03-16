@@ -1,0 +1,271 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Secure S3 upload infrastructure — private SSE-KMS bucket,
+  Lambda PutObject trigger, and an IAM user/role for the Next.js API.
+
+# ─── Parameters ────────────────────────────────────────────────────────────────
+Parameters:
+  AppName:
+    Type: String
+    Default: tax-agent
+    Description: Prefix applied to all resource names.
+
+  LambdaLogRetentionDays:
+    Type: Number
+    Default: 30
+    Description: CloudWatch log retention for the Lambda function (days).
+
+# ─── Resources ─────────────────────────────────────────────────────────────────
+Resources:
+
+  # ── KMS key ────────────────────────────────────────────────────────────────
+  UploadKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub "${AppName} — SSE-KMS key for S3 upload bucket"
+      EnableKeyRotation: true          # annual automatic rotation
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          # Root account retains full control so the key is never locked out
+          - Sid: AllowRootAccount
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: "kms:*"
+            Resource: "*"
+          # S3 service needs these to use the key for SSE
+          - Sid: AllowS3Service
+            Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action:
+              - kms:GenerateDataKey
+              - kms:Decrypt
+            Resource: "*"
+          # Lambda execution role may call GetObject (e.g. to read metadata)
+          - Sid: AllowLambdaDecrypt
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt LambdaExecutionRole.Arn
+            Action:
+              - kms:GenerateDataKey
+              - kms:Decrypt
+            Resource: "*"
+          # Next.js API role needs to generate presigned URLs and read back objects
+          - Sid: AllowNextJSRole
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt NextJSAPIRole.Arn
+            Action:
+              - kms:GenerateDataKey
+              - kms:Decrypt
+            Resource: "*"
+
+  UploadKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/${AppName}-upload"
+      TargetKeyId: !Ref UploadKMSKey
+
+  # ── S3 bucket ──────────────────────────────────────────────────────────────
+  UploadBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AppName}-uploads-${AWS::AccountId}-${AWS::Region}"
+
+      # Block ALL public access
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+      # Default SSE-KMS encryption — objects without explicit headers also encrypted
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !GetAtt UploadKMSKey.Arn
+            BucketKeyEnabled: true  # reduces KMS API call costs
+
+      # Versioning — allows recovery of overwritten or deleted objects
+      VersioningConfiguration:
+        Status: Enabled
+
+      # Lifecycle — move objects to Intelligent-Tiering after 90 days
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToIntelligentTiering
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 90
+                StorageClass: INTELLIGENT_TIERING
+
+      # Enforce HTTPS-only requests
+      # (BucketPolicy below also enforces this via Deny)
+
+      # CORS — allow the Next.js origin to POST (presigned POST) and GET
+      CorsConfiguration:
+        CorsRules:
+          - AllowedOrigins:
+              - "http://localhost:3000"      # dev
+              # Add your production domain here, e.g.:
+              # - "https://your-app.example.com"
+            AllowedMethods:
+              - POST
+              - GET
+              - HEAD
+            AllowedHeaders:
+              - "*"
+            ExposedHeaders:
+              - ETag
+            MaxAge: 3600
+
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: "s3:ObjectCreated:Put"
+            Function: !GetAtt UploadTriggerFunction.Arn
+
+    DependsOn: BucketInvokeLambdaPermission
+
+  # Bucket policy — deny non-HTTPS and non-KMS uploads
+  UploadBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref UploadBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          # Deny unencrypted (non-HTTPS) transport
+          - Sid: DenyNonHTTPS
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt UploadBucket.Arn
+              - !Sub "${UploadBucket.Arn}/*"
+            Condition:
+              Bool:
+                "aws:SecureTransport": "false"
+          # Deny PutObject requests that don't use SSE-KMS
+          - Sid: DenyNonKMSEncryption
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:PutObject"
+            Resource: !Sub "${UploadBucket.Arn}/*"
+            Condition:
+              StringNotEquals:
+                "s3:x-amz-server-side-encryption": "aws:kms"
+
+  # ── Lambda execution role ───────────────────────────────────────────────────
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AppName}-lambda-execution-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3ReadPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:HeadObject
+                Resource: !Sub "arn:aws:s3:::${AppName}-uploads-${AWS::AccountId}-${AWS::Region}/*"
+
+  # ── Lambda function ─────────────────────────────────────────────────────────
+  UploadTriggerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AppName}-upload-trigger"
+      Handler: index.handler
+      Runtime: nodejs20.x
+      CodeUri: ../lambda/
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          APP_NAME: !Ref AppName
+      # No Events here — S3 notification is wired on the bucket side above.
+      # SAM's Events property creates an SQS/SNS based trigger; for direct
+      # S3 → Lambda we use the bucket NotificationConfiguration + permission below.
+
+  UploadTriggerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AppName}-upload-trigger"
+      RetentionInDays: !Ref LambdaLogRetentionDays
+
+  # Allow S3 to invoke the Lambda
+  BucketInvokeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt UploadTriggerFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      # SourceArn is not set here because the bucket ARN contains the bucket
+      # name which itself depends on the Lambda ARN — circular reference.
+      # SourceAccount restriction is sufficient to prevent confused-deputy issues.
+
+  # ── IAM role for Next.js API (used in production via IRSA / instance role) ─
+  NextJSAPIRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AppName}-nextjs-api-role"
+      Description: "Assumed by the Next.js API to generate presigned URLs and read objects."
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          # Update Principal for your compute platform:
+          #   EC2: replace with instance profile ARN
+          #   ECS: replace with task role ARN
+          #   EKS (IRSA): add OIDC provider condition
+          - Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: S3PresignPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: AllowPresignedPostAndGet
+                Effect: Allow
+                Action:
+                  - s3:PutObject       # required to sign the presigned POST
+                  - s3:GetObject       # required to sign the presigned GET
+                  - s3:HeadObject
+                Resource: !Sub "arn:aws:s3:::${AppName}-uploads-${AWS::AccountId}-${AWS::Region}/*"
+
+# ─── Outputs ───────────────────────────────────────────────────────────────────
+Outputs:
+  BucketName:
+    Description: S3 bucket name — set as S3_BUCKET_NAME in .env.local
+    Value: !Ref UploadBucket
+
+  KMSKeyId:
+    Description: KMS key ARN — set as KMS_KEY_ID in .env.local
+    Value: !GetAtt UploadKMSKey.Arn
+
+  KMSKeyAlias:
+    Value: !Ref UploadKMSKeyAlias
+
+  LambdaFunctionArn:
+    Value: !GetAtt UploadTriggerFunction.Arn
+
+  NextJSAPIRoleArn:
+    Description: Assume this role in the Next.js runtime for least-privilege S3 access
+    Value: !GetAtt NextJSAPIRole.Arn

@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>W2TextractCdk</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- CDK v2 — everything in one package -->
+    <PackageReference Include="Amazon.CDK.Lib"   Version="2.130.0" />
+    <PackageReference Include="Constructs"        Version="10.3.0"  />
+  </ItemGroup>
+</Project>
