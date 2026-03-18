@@ -173,30 +173,9 @@ public sealed class TaxPipelineStack : Stack
             fn.GrantInvoke(sfnRole);
         }
 
-        // Allow Step Functions to write execution history to CloudWatch Logs
-        sfnRole.AddToPolicy(new PolicyStatement(new PolicyStatementProps
-        {
-            Actions = new[]
-            {
-                "logs:CreateLogDelivery",
-                "logs:CreateLogGroup",
-                "logs:CreateLogStream",
-                "logs:DescribeLogGroups",
-                "logs:DescribeLogStreams",
-                "logs:DescribeResourcePolicies",
-                "logs:GetLogDelivery",
-                "logs:ListLogDeliveries",
-                "logs:PutLogEvents",
-                "logs:PutResourcePolicy",
-                "logs:UpdateLogDelivery",
-                "logs:DeleteLogDelivery",
-            },
-            Resources = new[] { "*" },
-        }));
-
         // ── State machine ─────────────────────────────────────────────────────
-        var aslPath  = Path.GetFullPath("../infrastructure/statemachine/tax_pipeline.asl.json");
-        var aslBody  = File.ReadAllText(aslPath);
+        var aslPath = Path.GetFullPath("../infrastructure/statemachine/tax_pipeline.asl.json");
+        var aslBody = File.ReadAllText(aslPath);
 
         var sfnLogGroup = new LogGroup(this, "StateMachineLogGroup", new Amazon.CDK.AWS.Logs.LogGroupProps
         {
@@ -205,24 +184,17 @@ public sealed class TaxPipelineStack : Stack
             RemovalPolicy = RemovalPolicy.DESTROY,
         });
 
-        // Step Functions uses the log delivery service — requires a resource policy
-        // on the log group in addition to the IAM role permissions.
-        sfnLogGroup.AddToResourcePolicy(new PolicyStatement(new PolicyStatementProps
-        {
-            Effect     = Effect.ALLOW,
-            Principals = new IPrincipal[] { new ServicePrincipal("delivery.logs.amazonaws.com") },
-            Actions    = new[] { "logs:CreateLogStream", "logs:PutLogEvents" },
-            Resources  = new[] { sfnLogGroup.LogGroupArn + ":*" },
-        }));
-
-        var stateMachine = new CfnStateMachine(this, "TaxPipelineStateMachine",
-            new CfnStateMachineProps
+        // L2 StateMachine — handles IAM grants, log group resource policy, and
+        // dependency ordering automatically, avoiding the IAM eventual-consistency
+        // failure that plagued the previous CfnStateMachine (L1) approach.
+        var stateMachine = new StateMachine(this, "TaxPipelineStateMachine",
+            new StateMachineProps
             {
                 StateMachineName = "tax-document-pipeline",
-                StateMachineType = "STANDARD",
-                RoleArn          = sfnRole.RoleArn,
+                StateMachineType = StateMachineType.STANDARD,
+                Role             = sfnRole,
                 // CDK DefinitionSubstitutions replaces ${...} tokens in the ASL at deploy time
-                DefinitionString = aslBody,
+                DefinitionBody          = DefinitionBody.FromString(aslBody),
                 DefinitionSubstitutions = new Dictionary<string, string>
                 {
                     ["TextractFunctionArn"]     = textractFn.FunctionArn,
@@ -231,46 +203,33 @@ public sealed class TaxPipelineStack : Stack
                     ["PDFGeneratorFunctionArn"] = pdfFn.FunctionArn,
                     ["ErrorHandlerFunctionArn"] = errorFn.FunctionArn,
                 },
-                LoggingConfiguration = new CfnStateMachine.LoggingConfigurationProperty
+                Logs = new LogOptions
                 {
-                    Level                  = "ERROR",
-                    IncludeExecutionData   = true,
-                    Destinations = new[]
-                    {
-                        new CfnStateMachine.LogDestinationProperty
-                        {
-                            CloudWatchLogsLogGroup =
-                                new CfnStateMachine.CloudWatchLogsLogGroupProperty
-                                {
-                                    LogGroupArn = sfnLogGroup.LogGroupArn,
-                                },
-                        },
-                    },
+                    Destination          = sfnLogGroup,
+                    Level                = LogLevel.ERROR,
+                    IncludeExecutionData = true,
                 },
-                TracingConfiguration = new CfnStateMachine.TracingConfigurationProperty
-                {
-                    Enabled = true,  // X-Ray tracing for end-to-end visibility
-                },
+                TracingEnabled = true,
             });
-
-        var stateMachineArn = stateMachine.Ref;
 
         // ── EventBridge rule: S3 PutObject → Step Functions ───────────────────
         // EventBridge S3 notifications require the source bucket to have
         // EventBridge notifications enabled (set in W2TextractStack or here).
+        // No explicit Role — CDK creates the correct events.amazonaws.com role
+        // automatically. Passing the SFN execution role here was a bug since
+        // that role trusts states.amazonaws.com, not events.amazonaws.com.
         var sfnTarget = new SfnStateMachine(
-            Amazon.CDK.AWS.StepFunctions.StateMachine.FromStateMachineArn(
-                this, "ImportedSfn", stateMachineArn),
+            stateMachine,
             new SfnStateMachineProps
             {
-                Role  = sfnRole,
-                // Transform the EventBridge event into the Step Functions input shape
+                // Transform the EventBridge event into the Step Functions input shape.
+                // document_type is intentionally omitted — the Textract Lambda derives
+                // it authoritatively from the S3 key (uploads/{userId}/{date}/{docType}/...).
                 Input = RuleTargetInput.FromObject(new Dictionary<string, object>
                 {
-                    ["bucket"]        = EventField.FromPath("$.detail.bucket.name"),
-                    ["key"]           = EventField.FromPath("$.detail.object.key"),
-                    ["user_id"]       = EventField.FromPath("$.detail.object.key"),  // placeholder — enrich upstream
-                    ["document_type"] = "W2",
+                    ["bucket"]         = EventField.FromPath("$.detail.bucket.name"),
+                    ["key"]            = EventField.FromPath("$.detail.object.key"),
+                    ["user_id"]        = EventField.FromPath("$.detail.object.key"),
                     ["correlation_id"] = EventField.FromPath("$.id"),
                 }),
             });
@@ -291,10 +250,9 @@ public sealed class TaxPipelineStack : Stack
                     },
                     ["object"] = new Dictionary<string, object>
                     {
-                        ["key"] = new Dictionary<string, object>
-                        {
-                            ["prefix"] = "uploads/",
-                        },
+                        // EventBridge requires prefix as an array of matcher objects,
+                        // not a plain string — e.g. [{"prefix": "uploads/"}]
+                        ["key"] = new object[] { new Dictionary<string, string> { ["prefix"] = "uploads/" } },
                     },
                 },
             },
@@ -305,7 +263,7 @@ public sealed class TaxPipelineStack : Stack
         _ = new CfnOutput(this, "StateMachineArn", new CfnOutputProps
         {
             Description = "Tax pipeline state machine ARN",
-            Value       = stateMachineArn,
+            Value       = stateMachine.StateMachineArn,
             ExportName  = "TaxPipelineStateMachineArn",
         });
 

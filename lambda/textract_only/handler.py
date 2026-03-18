@@ -59,9 +59,61 @@ _W2_QUERIES = [
 
 assert len(_W2_QUERIES) <= 30, "Textract QUERIES adapter hard limit is 30"
 
+_1099_NEC_QUERIES = [
+    {"Text": "What is the payer taxpayer identification number?",          "Alias": "payer_tin"},
+    {"Text": "What is the payer name?",                                    "Alias": "payer_name"},
+    {"Text": "What is the payer address?",                                 "Alias": "payer_address"},
+    {"Text": "What is the recipient taxpayer identification number?",      "Alias": "recipient_tin"},
+    {"Text": "What is the recipient name?",                                "Alias": "recipient_name"},
+    {"Text": "What is the recipient address?",                             "Alias": "recipient_address"},
+    {"Text": "What is the account number?",                                "Alias": "account_number"},
+    {"Text": "What is the tax year?",                                      "Alias": "tax_year"},
+    {"Text": "What is the amount in Box 1 nonemployee compensation?",      "Alias": "nonemployee_compensation"},
+    {"Text": "Is Box 2 payer made direct sales checked?",                  "Alias": "payer_made_direct_sales"},
+    {"Text": "What is the amount in Box 4 federal income tax withheld?",   "Alias": "federal_income_tax_withheld"},
+    {"Text": "What is the amount in Box 5 state tax withheld?",            "Alias": "state_tax_withheld"},
+    {"Text": "What is the state abbreviation in Box 6?",                   "Alias": "state"},
+    {"Text": "What is the payer state identification number in Box 6?",    "Alias": "payer_state_no"},
+    {"Text": "What is the amount in Box 7 state income?",                  "Alias": "state_income"},
+]
+
+assert len(_1099_NEC_QUERIES) <= 30, "Textract QUERIES adapter hard limit is 30"
+
+_1099_INT_QUERIES = [
+    {"Text": "What is the payer taxpayer identification number?",                            "Alias": "payer_tin"},
+    {"Text": "What is the payer name?",                                                      "Alias": "payer_name"},
+    {"Text": "What is the payer address?",                                                   "Alias": "payer_address"},
+    {"Text": "What is the recipient taxpayer identification number?",                        "Alias": "recipient_tin"},
+    {"Text": "What is the recipient name?",                                                  "Alias": "recipient_name"},
+    {"Text": "What is the recipient address?",                                               "Alias": "recipient_address"},
+    {"Text": "What is the account number?",                                                  "Alias": "account_number"},
+    {"Text": "What is the tax year?",                                                        "Alias": "tax_year"},
+    {"Text": "What is the amount in Box 1 interest income?",                                 "Alias": "interest_income"},
+    {"Text": "What is the amount in Box 2 early withdrawal penalty?",                        "Alias": "early_withdrawal_penalty"},
+    {"Text": "What is the amount in Box 3 US savings bond interest?",                        "Alias": "us_savings_bond_interest"},
+    {"Text": "What is the amount in Box 4 federal income tax withheld?",                     "Alias": "federal_income_tax_withheld"},
+    {"Text": "What is the amount in Box 5 investment expenses?",                             "Alias": "investment_expenses"},
+    {"Text": "What is the amount in Box 6 foreign tax paid?",                                "Alias": "foreign_tax_paid"},
+    {"Text": "What is the foreign country or US possession in Box 7?",                       "Alias": "foreign_country"},
+    {"Text": "What is the amount in Box 8 tax exempt interest?",                             "Alias": "tax_exempt_interest"},
+    {"Text": "What is the amount in Box 9 specified private activity bond interest?",        "Alias": "specified_private_activity_bond_interest"},
+    {"Text": "What is the amount in Box 10 market discount?",                                "Alias": "market_discount"},
+    {"Text": "What is the amount in Box 11 bond premium?",                                   "Alias": "bond_premium"},
+    {"Text": "What is the amount in Box 12 bond premium on treasury obligations?",           "Alias": "bond_premium_on_treasury_obligations"},
+    {"Text": "What is the amount in Box 13 bond premium on tax exempt bonds?",               "Alias": "bond_premium_on_tax_exempt_bonds"},
+    {"Text": "What is the CUSIP number in Box 14?",                                          "Alias": "tax_exempt_bond_cusip"},
+    {"Text": "What is the amount in Box 15 state tax withheld?",                             "Alias": "state_tax_withheld"},
+    {"Text": "What is the state abbreviation in Box 16?",                                    "Alias": "state"},
+    {"Text": "What is the payer state identification number in Box 17?",                     "Alias": "state_id_no"},
+    {"Text": "What is the amount in Box 18 state income?",                                   "Alias": "state_income"},
+]
+
+assert len(_1099_INT_QUERIES) <= 30, "Textract QUERIES adapter hard limit is 30"
+
 _QUERIES_BY_DOC_TYPE: dict[str, list[dict]] = {
-    "W2": _W2_QUERIES,
-    # 1099 types: add their query lists here when needed
+    "W2":       _W2_QUERIES,
+    "1099-NEC": _1099_NEC_QUERIES,
+    "1099-INT": _1099_INT_QUERIES,
 }
 
 # ── AWS clients (module-level — shared across warm invocations) ────────────────
@@ -130,22 +182,23 @@ def _parse_blocks(
     return fields, flagged
 
 
-def _extract_user_id(key: str) -> str:
+def _extract_key_metadata(key: str) -> tuple[str, str]:
     """
-    Extract user_id from a user-scoped S3 key.
+    Extract (user_id, document_type) from a user-scoped S3 key.
 
-    Key format (set by Next.js /api/upload): uploads/{userId}/{date}/{uuid}.{ext}
-    Segment 0 = "uploads", segment 1 = userId.
+    Key format (set by Next.js /api/upload):
+        uploads/{userId}/{date}/{docType}/{uuid}.{ext}
+    Segment 0 = "uploads", 1 = userId, 2 = date, 3 = docType, 4 = filename.
 
     Raises ValueError if the key does not conform to this format.
     """
     parts = key.split("/")
-    if len(parts) < 3 or parts[0] != "uploads":
+    if len(parts) < 5 or parts[0] != "uploads":
         raise ValueError(
             f"S3 key {key!r} does not match expected format "
-            "'uploads/{{userId}}/{{date}}/{{filename}}'"
+            "'uploads/{{userId}}/{{date}}/{{docType}}/{{filename}}'"
         )
-    return parts[1]
+    return parts[1], parts[3]
 
 
 def _build_payload(
@@ -183,14 +236,17 @@ def _build_payload(
 # ── Lambda entry point ─────────────────────────────────────────────────────────
 
 def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
-    bucket        = event["bucket"]
-    key           = event["key"]
-    document_type = event.get("document_type", "W2")
+    bucket = event["bucket"]
+    key    = event["key"]
 
-    # Extract user_id from the S3 key prefix (uploads/{userId}/...) set by
-    # the authenticated Next.js upload route. The Step Functions pipeline
-    # passes this through to the DynamoDB store Lambda as the partition key.
-    user_id = event.get("user_id") or _extract_user_id(key)
+    # Extract user_id and document_type from the S3 key — the key is the
+    # authoritative source because it was written by the authenticated
+    # Next.js upload route and cannot be spoofed via the EventBridge event.
+    # The EventBridge input transformer still passes document_type as a
+    # fallback, but the key-derived value takes precedence.
+    user_id_from_key, doc_type_from_key = _extract_key_metadata(key)
+    user_id       = event.get("user_id") or user_id_from_key
+    document_type = doc_type_from_key
 
     queries = _QUERIES_BY_DOC_TYPE.get(document_type)
     if queries is None:

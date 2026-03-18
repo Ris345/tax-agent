@@ -16,6 +16,9 @@ export type AllowedMimeType = (typeof ALLOWED_MIME_TYPES)[number];
 
 export const MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024; // 10 MB
 
+export const SUPPORTED_DOC_TYPES = ['W2', '1099-NEC', '1099-INT'] as const;
+export type SupportedDocType = (typeof SUPPORTED_DOC_TYPES)[number];
+
 const s3 = new S3Client({
   region: process.env.AWS_REGION ?? 'us-east-1',
   // In production on AWS (EC2/ECS/Lambda), credentials are picked up
@@ -26,18 +29,19 @@ const s3 = new S3Client({
 /**
  * Build an S3 key scoped to the authenticated user.
  *
- * Format: uploads/{userId}/{YYYY-MM-DD}/{uuid}.{ext}
+ * Format: uploads/{userId}/{YYYY-MM-DD}/{docType}/{uuid}.{ext}
  *
  * The userId segment means:
  *  - The presigned POST condition `starts-with($key, "uploads/{userId}/")`
  *    prevents one user from uploading into another user's prefix.
  *  - The confirm route can validate key ownership without a DB lookup.
- *  - The Step Functions pipeline extracts userId from key.split('/')[1].
+ *  - The Step Functions pipeline extracts userId from key.split('/')[1]
+ *    and document_type from key.split('/')[3].
  */
-function buildKey(userId: string, originalName: string): string {
+function buildKey(userId: string, originalName: string, documentType: SupportedDocType): string {
   const ext  = originalName.split('.').pop() ?? 'bin';
   const date = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
-  return `uploads/${userId}/${date}/${randomUUID()}.${ext}`;
+  return `uploads/${userId}/${date}/${documentType}/${randomUUID()}.${ext}`;
 }
 
 /**
@@ -53,6 +57,7 @@ export async function generatePresignedPost(
   userId: string,
   fileName: string,
   contentType: AllowedMimeType,
+  documentType: SupportedDocType,
 ): Promise<{ url: string; fields: Record<string, string>; key: string }> {
   const bucket = process.env.S3_BUCKET_NAME;
   const kmsKeyId = process.env.KMS_KEY_ID;
@@ -60,7 +65,7 @@ export async function generatePresignedPost(
   if (!bucket) throw new Error('S3_BUCKET_NAME environment variable is not set');
   if (!kmsKeyId) throw new Error('KMS_KEY_ID environment variable is not set');
 
-  const key = buildKey(userId, fileName);
+  const key = buildKey(userId, fileName, documentType);
 
   const { url, fields }: PresignedPost = await createPresignedPost(s3, {
     Bucket: bucket,

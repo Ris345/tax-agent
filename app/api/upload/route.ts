@@ -3,6 +3,8 @@ import {
   ALLOWED_MIME_TYPES,
   AllowedMimeType,
   MAX_FILE_SIZE_BYTES,
+  SUPPORTED_DOC_TYPES,
+  SupportedDocType,
   generatePresignedPost,
 } from '@/lib/s3';
 
@@ -18,10 +20,11 @@ export async function POST(req: NextRequest) {
 
   try {
     const body = await req.json();
-    const { fileName, contentType, fileSize } = body as {
-      fileName?:    string;
-      contentType?: string;
-      fileSize?:    number;
+    const { fileName, contentType, fileSize, documentType } = body as {
+      fileName?:     string;
+      contentType?:  string;
+      fileSize?:     number;
+      documentType?: string;
     };
 
     // ── Validation ──────────────────────────────────────────────────────────
@@ -46,14 +49,25 @@ export async function POST(req: NextRequest) {
       );
     }
 
+    if (!documentType || !(SUPPORTED_DOC_TYPES as readonly string[]).includes(documentType)) {
+      return NextResponse.json(
+        {
+          error: 'documentType is required. Supported values: ' + SUPPORTED_DOC_TYPES.join(', '),
+          supported: SUPPORTED_DOC_TYPES,
+        },
+        { status: 400 },
+      );
+    }
+
     // ── Presigned POST scoped to this user ──────────────────────────────────
-    // Key format: uploads/{userId}/{date}/{uuid}.{ext}
+    // Key format: uploads/{userId}/{date}/{docType}/{uuid}.{ext}
     // The policy condition enforces starts-with on the user prefix,
     // preventing uploads to any other user's path.
     const { url, fields, key } = await generatePresignedPost(
       userId,
       fileName,
       contentType as AllowedMimeType,
+      documentType as SupportedDocType,
     );
 
     return NextResponse.json({ url, fields, key });

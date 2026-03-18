@@ -46,9 +46,18 @@ const ALLOWED_TYPES = [
 const MAX_BYTES = 10 * 1024 * 1024;
 const ACCEPT = '.pdf,.jpg,.jpeg,.png,.gif,.webp,.tif,.tiff';
 
+const DOC_TYPE_OPTIONS = [
+  { value: 'W2',       label: 'W-2 — Wage and Tax Statement' },
+  { value: '1099-NEC', label: '1099-NEC — Nonemployee Compensation' },
+  { value: '1099-INT', label: '1099-INT — Interest Income' },
+] as const;
+
+type DocType = (typeof DOC_TYPE_OPTIONS)[number]['value'];
+
 export default function FileUpload() {
   const [state, setState] = useState<UploadState>({ status: 'idle' });
   const [dragOver, setDragOver] = useState(false);
+  const [documentType, setDocumentType] = useState<DocType | ''>('');
   const inputRef = useRef<HTMLInputElement>(null);
 
   function validate(file: File): string | null {
@@ -59,6 +68,11 @@ export default function FileUpload() {
   }
 
   async function handleFile(file: File) {
+    if (!documentType) {
+      setState({ status: 'error', message: 'Please select a document type before uploading.' });
+      return;
+    }
+
     const validationError = validate(file);
     if (validationError) {
       setState({ status: 'error', message: validationError });
@@ -72,7 +86,7 @@ export default function FileUpload() {
       const res = await authFetch('/api/upload', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ fileName: file.name, contentType: file.type, fileSize: file.size }),
+        body: JSON.stringify({ fileName: file.name, contentType: file.type, fileSize: file.size, documentType }),
       });
       if (!res.ok) {
         const { error } = await res.json();
@@ -136,16 +150,35 @@ export default function FileUpload() {
 
   return (
     <div className="w-full max-w-lg mx-auto space-y-4">
+      {/* Document type selector */}
+      <div className="space-y-1">
+        <label htmlFor="doc-type" className="block text-sm font-medium text-gray-700">
+          Document type
+        </label>
+        <select
+          id="doc-type"
+          value={documentType}
+          onChange={(e) => setDocumentType(e.target.value as DocType)}
+          disabled={busy}
+          className="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm text-gray-700 shadow-sm focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500 disabled:opacity-60"
+        >
+          <option value="">Select a form type...</option>
+          {DOC_TYPE_OPTIONS.map((opt) => (
+            <option key={opt.value} value={opt.value}>{opt.label}</option>
+          ))}
+        </select>
+      </div>
+
       {/* Drop zone */}
       <div
-        onClick={() => !busy && inputRef.current?.click()}
+        onClick={() => !busy && documentType && inputRef.current?.click()}
         onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
         onDragLeave={() => setDragOver(false)}
         onDrop={onDrop}
         className={[
-          'relative flex flex-col items-center justify-center gap-3 rounded-2xl border-2 border-dashed p-10 transition-colors cursor-pointer select-none',
+          'relative flex flex-col items-center justify-center gap-3 rounded-2xl border-2 border-dashed p-10 transition-colors select-none',
           dragOver ? 'border-blue-500 bg-blue-50' : 'border-gray-300 bg-gray-50 hover:border-blue-400',
-          busy ? 'opacity-60 cursor-not-allowed' : '',
+          busy || !documentType ? 'opacity-60 cursor-not-allowed' : 'cursor-pointer',
         ].join(' ')}
       >
         <input
